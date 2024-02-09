@@ -47,35 +47,20 @@
 //! - `is_exist`: Check if file exists.
 //! - `new_input`: Create input file for reading.
 //! - `new_output`: Create output file for writing.
+mod gcs;
+mod s3;
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::io::gcs::props_from_builder as gcs_props;
+use crate::io::s3::props_from_builder as s3_props;
 use crate::{error::Result, Error, ErrorKind};
 use futures::{AsyncRead, AsyncSeek, AsyncWrite};
-use once_cell::sync::Lazy;
 use opendal::{Operator, Scheme};
 use url::Url;
 
 /// Following are arguments for [s3 file io](https://py.iceberg.apache.org/configuration/#s3).
 /// S3 endopint.
-pub const S3_ENDPOINT: &str = "s3.endpoint";
-/// S3 access key id.
-pub const S3_ACCESS_KEY_ID: &str = "s3.access-key-id";
-/// S3 secret access key.
-pub const S3_SECRET_ACCESS_KEY: &str = "s3.secret-access-key";
-/// S3 region.
-pub const S3_REGION: &str = "s3.region";
-
-/// A mapping from iceberg s3 configuration key to [`opendal::Operator`] configuration key.
-static S3_CONFIG_MAPPING: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
-    let mut m = HashMap::with_capacity(4);
-    m.insert(S3_ENDPOINT, "endpoint");
-    m.insert(S3_ACCESS_KEY_ID, "access_key_id");
-    m.insert(S3_SECRET_ACCESS_KEY, "secret_access_key");
-    m.insert(S3_REGION, "region");
-
-    m
-});
 
 const DEFAULT_ROOT_PATH: &str = "/";
 
@@ -293,6 +278,10 @@ enum Storage {
         scheme_str: String,
         props: HashMap<String, String>,
     },
+    Gcs {
+        scheme_str: String,
+        props: HashMap<String, String>,
+    },
 }
 
 impl Storage {
@@ -341,6 +330,30 @@ impl Storage {
                     ))
                 }
             }
+            Storage::Gcs { scheme_str, props } => {
+                let mut props = props.clone();
+                let url = Url::parse(path)?;
+                let bucket = url.host_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid GCS url: {}, missing bucket", path),
+                    )
+                })?;
+
+                props.insert("bucket".to_string(), bucket.to_string());
+                let prefix = format!("{}://{}/", scheme_str, bucket);
+                if path.starts_with(&prefix) {
+                    Ok((
+                        Operator::via_map(Scheme::Gcs, props)?,
+                        &path[prefix.len()..],
+                    ))
+                } else {
+                    Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Invalid GCS url: {}, should start with {}", path, prefix),
+                    ))
+                }
+            }
         }
     }
 
@@ -349,6 +362,7 @@ impl Storage {
         match scheme {
             "file" | "" => Ok(Scheme::Fs),
             "s3" | "s3a" => Ok(Scheme::S3),
+            "gs" => Ok(Scheme::Gcs),
             s => Ok(s.parse::<Scheme>()?),
         }
     }
@@ -364,18 +378,14 @@ impl Storage {
             Scheme::Fs => Ok(Self::LocalFs {
                 op: Operator::via_map(Scheme::Fs, new_props)?,
             }),
-            Scheme::S3 => {
-                for prop in file_io_builder.props {
-                    if let Some(op_key) = S3_CONFIG_MAPPING.get(prop.0.as_str()) {
-                        new_props.insert(op_key.to_string(), prop.1);
-                    }
-                }
-
-                Ok(Self::S3 {
-                    scheme_str,
-                    props: new_props,
-                })
-            }
+            Scheme::S3 => Ok(Self::S3 {
+                scheme_str,
+                props: s3_props(&file_io_builder.props, new_props),
+            }),
+            Scheme::Gcs => Ok(Self::Gcs {
+                scheme_str,
+                props: gcs_props(&file_io_builder.props, new_props),
+            }),
             _ => Err(Error::new(
                 ErrorKind::FeatureUnsupported,
                 format!("Constructing file io from scheme: {scheme} not supported now",),
